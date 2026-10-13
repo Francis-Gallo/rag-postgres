@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import psycopg2
 import requests
 
@@ -34,17 +34,19 @@ class IngestRequest(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    top_k: int = 3
+    top_k: int = Field(default=3, ge=1)
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def get_embedding(text: str):
+def get_embedding(text: str, prefix: str):
+    # nomic-embed-text-v1.5 ignores the retrieval task unless the input
+    # starts with search_document: or search_query:.
     response = requests.post(
         EMBEDDING_URL,
         json={
             "model": EMBED_MODEL,
-            "input": text
+            "input": f"{prefix}{text}"
         }
     )
     return response.json()["data"][0]["embedding"]
@@ -82,7 +84,7 @@ Answer clearly and concisely.
 # ----------------------------
 @app.post("/ingest")
 def ingest(req: IngestRequest):
-    embedding = get_embedding(req.content)
+    embedding = get_embedding(req.content, "search_document: ")
 
     cur = conn.cursor()
     cur.execute(
@@ -97,14 +99,16 @@ def ingest(req: IngestRequest):
 
 @app.post("/search")
 def search(req: SearchRequest):
-    query_embedding = get_embedding(req.query)
+    query_embedding = get_embedding(req.query, "search_query: ")
 
     cur = conn.cursor()
+    # Cosine distance. These embeddings are normalized, and an ivfflat index
+    # is used only when its opclass matches the operator (vector_cosine_ops).
     cur.execute(
         """
         SELECT content
         FROM documents
-        ORDER BY embedding <-> %s::vector
+        ORDER BY embedding <=> %s::vector
         LIMIT %s;
         """,
         (query_embedding, req.top_k)
