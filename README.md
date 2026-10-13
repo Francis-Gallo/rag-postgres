@@ -11,13 +11,15 @@ generation both use [LM Studio](https://lmstudio.ai/)'s OpenAI-compatible server
 ## How it works
 
 ```
-POST /ingest  {content}          ──► embed (nomic-embed-text-v1.5, 768-d) ──► INSERT INTO documents
-POST /search  {query, top_k=3}   ──► embed query ──► ORDER BY embedding <-> query LIMIT top_k
-                                                  ──► phi-3.1-mini-4k-instruct answers from the retrieved text
-                                                  ──► {query, answer, sources}
+POST /ingest  {content}          ──► embed search_document: … (nomic-embed-text-v1.5, 768-d) ──► INSERT INTO documents
+POST /search  {query, top_k=3}   ──► embed search_query: … ──► ORDER BY embedding <=> query LIMIT top_k
+                                                             ──► phi-3.1-mini-4k-instruct answers from the retrieved text
+                                                             ──► {query, answer, sources}
 ```
 
-The whole service is one file, `main.py` (about 120 lines).
+nomic-embed-text-v1.5 requires those task prefixes, and it returns normalized vectors, so search uses cosine distance (`<=>`).
+
+The whole service is one file, `main.py` (about 130 lines).
 
 ## Quickstart
 
@@ -39,25 +41,32 @@ CREATE TABLE documents (
     content TEXT,
     embedding vector(768)
 );
-
--- Optional ANN index. main.py searches with the L2 operator (<->), so the index must use vector_l2_ops
--- or PostgreSQL will not use it. Build it after you have ingested some rows.
-CREATE INDEX documents_embedding_idx ON documents
-USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
 ```
 
-**3. Start LM Studio** with the local server on `http://127.0.0.1:1234` and both models loaded:
+Optional ANN index, **after** the table has rows. `main.py` orders by cosine distance (`<=>`), so the opclass has to be `vector_cosine_ops` or PostgreSQL will not use the index. `lists` should stay well below the row count (a common start is `rows / 1000`). An ivfflat index built on an empty or tiny table is still chosen by the planner, and it can return fewer rows than `top_k`.
+
+```sql
+CREATE INDEX documents_embedding_idx ON documents
+USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+```
+
+**3. Install dependencies.** `test_embedding.py` imports `requests`, so install before running it.
+
+```bash
+python -m venv venv && source venv/bin/activate     # Windows: venv\Scripts\activate
+pip install fastapi uvicorn psycopg2-binary requests
+```
+
+**4. Start LM Studio** with the local server on `http://127.0.0.1:1234` and both models loaded:
 `text-embedding-nomic-embed-text-v1.5` and `phi-3.1-mini-4k-instruct`. Check the embedding endpoint:
 
 ```bash
 python test_embedding.py      # prints: Embedding length: 768
 ```
 
-**4. Run the API**
+**5. Run the API**
 
 ```bash
-python -m venv venv && source venv/bin/activate     # Windows: venv\Scripts\activate
-pip install fastapi uvicorn psycopg2-binary requests
 uvicorn main:app --reload                           # Swagger UI: http://127.0.0.1:8000/docs
 ```
 
@@ -90,7 +99,7 @@ environment variables before deploying anywhere.
 ## Ideas for next steps
 
 - Chunk long documents on ingest and keep their metadata (source, position)
-- Use cosine distance (`<=>`) with a `vector_cosine_ops` HNSW index
+- Replace the IVFFlat index with HNSW (`vector_cosine_ops`) for better recall on a larger table
 - Read settings from environment variables, add `requirements.txt` and a `docker-compose.yml` that starts both services
 - A small retrieval evaluation (hit rate @k on a handful of question/answer pairs)
 
