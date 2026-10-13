@@ -1,360 +1,99 @@
-\# RAG Backend with FastAPI and PostgreSQL (pgvector)
+# rag-postgres: a minimal RAG API on PostgreSQL + pgvector
 
+A small FastAPI service that stores text with its embeddings in PostgreSQL (pgvector), retrieves the closest
+documents for a question, and asks a local LLM to answer **only from those documents**. Embeddings and
+generation both use [LM Studio](https://lmstudio.ai/)'s OpenAI-compatible server, so nothing leaves your machine.
 
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL%2016-pgvector-4169E1?logo=postgresql&logoColor=white)
+![LM Studio](https://img.shields.io/badge/LLM-LM%20Studio%20(local)-6D28D9)
 
-This project is a minimal but production-style Retrieval-Augmented Generation (RAG)
-
-backend built using FastAPI, PostgreSQL, and pgvector.
-
-
-
-It demonstrates how to store vector embeddings in a relational database and perform
-
-semantic search using cosine similarity.
-
-
-
----
-
-
-
-\## What This Project Does
-
-
-
-1\. Accepts text documents through an API
-
-2\. Converts text into vector embeddings using a local embedding model (LM Studio)
-
-3\. Stores embeddings in PostgreSQL using pgvector
-
-4\. Performs semantic similarity search
-
-5\. Returns the most relevant documents
-
-6\. Generates an answer using retrieved context
-
-
-
----
-
-
-
-\## Tech Stack
-
-
-
-\- Python
-
-\- FastAPI
-
-\- PostgreSQL
-
-\- pgvector
-
-\- Docker
-
-\- LM Studio (OpenAI-compatible local API)
-
-
-
----
-
-
-
-\## High-Level Architecture
-
-
-
-Client  
-
-→ FastAPI Backend  
-
-→ Embedding Model (LM Studio)  
-
-→ PostgreSQL + pgvector  
-
-→ Semantic Search Results  
-
-
-
----
-
-
-
-\## PostgreSQL + pgvector Setup
-
-
-
-Run PostgreSQL with pgvector using Docker:
-
-
-
-```bash
-
-docker run -d \\
-
-&nbsp; --name pgvector-db \\
-
-&nbsp; -p 5432:5432 \\
-
-&nbsp; -e POSTGRES\_USER=raguser \\
-
-&nbsp; -e POSTGRES\_PASSWORD=ragpass \\
-
-&nbsp; -e POSTGRES\_DB=ragdb \\
-
-&nbsp; pgvector/pgvector:pg16
+## How it works
 
 ```
+POST /ingest  {content}          ──► embed (nomic-embed-text-v1.5, 768-d) ──► INSERT INTO documents
+POST /search  {query, top_k=3}   ──► embed query ──► ORDER BY embedding <-> query LIMIT top_k
+                                                  ──► phi-3.1-mini-4k-instruct answers from the retrieved text
+                                                  ──► {query, answer, sources}
+```
 
+The whole service is one file, `main.py` (about 120 lines).
 
+## Quickstart
 
-Enable the pgvector extension:
+**1. Start PostgreSQL with pgvector**
 
+```bash
+docker run -d --name pgvector-db -p 5432:5432 \
+  -e POSTGRES_USER=raguser -e POSTGRES_PASSWORD=ragpass -e POSTGRES_DB=ragdb \
+  pgvector/pgvector:pg16
+```
 
+**2. Create the table.** `main.py` does not create it for you. For example, run `docker exec -it pgvector-db psql -U raguser -d ragdb`, then:
 
 ```sql
-
 CREATE EXTENSION IF NOT EXISTS vector;
 
-```
-
-
-
----
-
-
-
-\## Database Schema
-
-
-
-```sql
-
 CREATE TABLE documents (
-
-&nbsp;   id SERIAL PRIMARY KEY,
-
-&nbsp;   content TEXT,
-
-&nbsp;   embedding vector(768)
-
+    id SERIAL PRIMARY KEY,
+    content TEXT,
+    embedding vector(768)
 );
 
-
-
-CREATE INDEX documents\_embedding\_idx
-
-ON documents
-
-USING ivfflat (embedding vector\_cosine\_ops)
-
-WITH (lists = 100);
-
+-- Optional ANN index. main.py searches with the L2 operator (<->), so the index must use vector_l2_ops
+-- or PostgreSQL will not use it. Build it after you have ingested some rows.
+CREATE INDEX documents_embedding_idx ON documents
+USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
 ```
 
-
-
----
-
-
-
-\## Running the Backend
-
-
-
-Create and activate a virtual environment:
-
-
+**3. Start LM Studio** with the local server on `http://127.0.0.1:1234` and both models loaded:
+`text-embedding-nomic-embed-text-v1.5` and `phi-3.1-mini-4k-instruct`. Check the embedding endpoint:
 
 ```bash
-
-python -m venv venv
-
-venv\\Scripts\\activate
-
+python test_embedding.py      # prints: Embedding length: 768
 ```
 
-
-
-Install dependencies:
-
-
+**4. Run the API**
 
 ```bash
-
-pip install fastapi uvicorn psycopg2 requests
-
+python -m venv venv && source venv/bin/activate     # Windows: venv\Scripts\activate
+pip install fastapi uvicorn psycopg2-binary requests
+uvicorn main:app --reload                           # Swagger UI: http://127.0.0.1:8000/docs
 ```
 
+## API
 
-
-Start the API server:
-
-
+| Endpoint | Body | Returns |
+|---|---|---|
+| `POST /ingest` | `{"content": "Postgres with pgvector is excellent for RAG systems"}` | `{"status": "success", "embedding_length": 768}` |
+| `POST /search` | `{"query": "What is pgvector used for?", "top_k": 3}` | `{"query", "answer", "sources": [...]}` |
 
 ```bash
-
-uvicorn main:app --reload
-
+curl -X POST localhost:8000/ingest -H 'Content-Type: application/json' \
+     -d '{"content": "pgvector adds a vector type and similarity search to PostgreSQL."}'
+curl -X POST localhost:8000/search -H 'Content-Type: application/json' \
+     -d '{"query": "What does pgvector add?", "top_k": 3}'
 ```
 
+## Configuration
 
+The database credentials (`raguser` / `ragpass` / `ragdb` on `localhost:5432`), LM Studio URLs and model names are
+constants at the top of `main.py`. These are local development defaults. Change them there, or move them to
+environment variables before deploying anywhere.
 
-Open Swagger UI:
+## Limitations
 
+- Each `/ingest` call stores the text as one row. There is no chunking, file upload or deduplication yet.
+- One global database connection with autocommit. Fine for a demo, not for concurrent load.
+- No error handling for LM Studio being down or returning an error. These surface as HTTP 500.
 
+## Ideas for next steps
 
-```
+- Chunk long documents on ingest and keep their metadata (source, position)
+- Use cosine distance (`<=>`) with a `vector_cosine_ops` HNSW index
+- Read settings from environment variables, add `requirements.txt` and a `docker-compose.yml` that starts both services
+- A small retrieval evaluation (hit rate @k on a handful of question/answer pairs)
 
-http://127.0.0.1:8000/docs
+## Author
 
-```
-
-
-
----
-
-
-
-\## LM Studio Setup
-
-
-
-1\. Load an embedding model (example: nomic-embed-text-v1.5)
-
-2\. Enable OpenAI-compatible API
-
-3\. Default embedding endpoint used:
-
-
-
-```
-
-http://127.0.0.1:1234/v1/embeddings
-
-```
-
-
-
----
-
-
-
-\## API Endpoints
-
-
-
-\### Ingest Document
-
-
-
-POST `/ingest`
-
-
-
-```json
-
-{
-
-&nbsp; "content": "Postgres with pgvector is excellent for RAG systems"
-
-}
-
-```
-
-
-
----
-
-
-
-\### Semantic Search
-
-
-
-POST `/search`
-
-
-
-```json
-
-{
-
-&nbsp; "query": "What is pgvector used for?",
-
-&nbsp; "top\_k": 3
-
-}
-
-```
-
-
-
----
-
-
-
-\## Embedding Test Script
-
-
-
-Run:
-
-
-
-```bash
-
-python test\_embedding.py
-
-```
-
-
-
-Expected output:
-
-
-
-```
-
-Embedding length: 768
-
-```
-
-
-
----
-
-
-
-\## Why This Is Production-Style
-
-
-
-\- Uses PostgreSQL instead of an in-memory vector store
-
-\- Clean API boundaries with FastAPI
-
-\- Dockerized infrastructure
-
-\- OpenAI-compatible local model support
-
-\- Easily extendable to chat or agent-based systems
-
-
-
----
-
-
-
-\## Author
-
-
-
-Francis Gallo  
-
-Built to understand real-world RAG systems from the ground up
-
-
-
+Francis Gallo Sahayaraj. Built to understand RAG on a relational database from the ground up.
