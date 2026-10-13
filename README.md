@@ -41,9 +41,11 @@ CREATE TABLE documents (
     content TEXT,
     embedding vector(768)
 );
+```
 
--- Optional ANN index. main.py orders by cosine distance (<=>). The index must use
--- vector_cosine_ops or PostgreSQL will not use it. Build it after you have ingested some rows.
+Optional ANN index, **after** the table has rows. `main.py` orders by cosine distance (`<=>`), so the opclass has to be `vector_cosine_ops` or PostgreSQL will not use the index. `lists` should stay well below the row count (a common start is `rows / 1000`). An ivfflat index built on an empty or tiny table is still chosen by the planner, and it can return fewer rows than `top_k`.
+
+```sql
 CREATE INDEX documents_embedding_idx ON documents
 USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ```
